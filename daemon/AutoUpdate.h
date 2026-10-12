@@ -14,7 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
  * retries on the next interval; the running daemon is never bricked.
  *
  * Configuration (all environment variables):
- *   RDP_UPDATE_ENABLED       "1" (default) enables; "0" disables entirely.
+ *   RDP_UPDATE_ENABLED       "1" enables; anything else (default) disables. [local patch]
  *   RDP_UPDATE_INTERVAL_MIN  Check interval in minutes (default 5).
  *   RDP_UPDATE_REPO          GitHub "owner/repo" (default grioghar/macos-rdp-server).
  *   RDP_UPDATE_TOKEN         Optional Bearer token for a private repo.

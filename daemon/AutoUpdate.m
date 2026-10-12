@@ -75,8 +75,10 @@ static NSString *signKeychain(void) {
 + (void)start {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        if (![envStr("RDP_UPDATE_ENABLED", @"1") isEqualToString:@"1"]) {
-            rdp_info("auto-update disabled (RDP_UPDATE_ENABLED=0)");
+        /* Local patch: default OFF. Upstream releases are arm64-only, so an
+         * auto-update would replace this x86_64 build with one that can't run. */
+        if (![envStr("RDP_UPDATE_ENABLED", @"0") isEqualToString:@"1"]) {
+            rdp_info("auto-update disabled (set RDP_UPDATE_ENABLED=1 to enable)");
             return;
         }
         g_updater = [[AutoUpdate alloc] init];
