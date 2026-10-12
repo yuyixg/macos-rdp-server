@@ -338,13 +338,80 @@ static void recover_disabled_displays(void) {
  * the virtual display out of the way, so a physical display reclaims (0,0)),
  * and once after it is gone (vdid == 0) to settle any shuffle WindowServer did.
  * A no-op if a newer session has taken over the layout. */
+/* SACLockScreenImmediate from the private login.framework (same as Ctrl+Cmd+Q). */
+static void (*lock_fn(void))(void) {
+    static void (*fn)(void) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *h = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login",
+                         RTLD_LAZY);
+        if (h) fn = (void (*)(void))dlsym(h, "SACLockScreenImmediate");
+    });
+    return fn;
+}
+
+static BOOL session_screen_locked(void) {
+    CFDictionaryRef d = CGSessionCopyCurrentDictionary();
+    if (!d) return NO;
+    CFBooleanRef v = CFDictionaryGetValue(d, CFSTR("CGSSessionScreenIsLocked"));
+    BOOL locked = (v && CFBooleanGetValue(v));
+    CFRelease(d);
+    return locked;
+}
+
+/* How many on-screen loginwindow (lock UI) windows intersect this display. */
+static uint32_t lock_windows_on_display(CGDirectDisplayID did) {
+    CGRect db = CGDisplayBounds(did);
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+    if (!list) return 0;
+    uint32_t n = 0;
+    for (NSDictionary *w in (__bridge NSArray *)list) {
+        if (![w[(__bridge NSString *)kCGWindowOwnerName] isEqual:@"loginwindow"]) continue;
+        CGRect wb;
+        if (CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)w[(__bridge NSString *)kCGWindowBounds], &wb) &&
+            CGRectIntersectsRect(wb, db)) n++;
+    }
+    CFRelease(list);
+    return n;
+}
+
+/* Connecting to a locked Mac: loginwindow does cover the new virtual display,
+ * but macOS 15 shows only the wallpaper until a key/mouse event brings up the
+ * password field. Log it so "only wallpaper" reports are easy to diagnose. */
+static void log_lock_state_at_connect(CGDirectDisplayID vdid) {
+    if (!session_screen_locked()) return;
+    rdp_info("screen is locked at connect (%u lock-UI window(s) on virtual display) — "
+             "press any key in the client to show the password field",
+             lock_windows_on_display(vdid));
+}
+
+/* Lock the Mac on disconnect. RDP_LOCK_ON_DISCONNECT=0 disables. Remote unlock
+ * works: the lock screen accepts the injected password keystrokes. */
+static void lock_screen_now(void) {
+    const char *e = getenv("RDP_LOCK_ON_DISCONNECT");
+    if (e && strcmp(e, "0") == 0) return;
+    void (*lockFn)(void) = lock_fn();
+    if (lockFn) {
+        lockFn();
+        rdp_info("screen locked on disconnect (RDP_LOCK_ON_DISCONNECT=0 to disable)");
+    } else {
+        rdp_error("SACLockScreenImmediate unavailable — screen NOT locked on disconnect");
+    }
+}
+
 static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
     pthread_mutex_lock(&g_layoutLock);
-    if (gen != 0 && gen == g_layoutGen) {
+    BOOL owner = (gen != 0 && gen == g_layoutGen);
+    if (owner) {
         restore_saved_layout_locked(vdid);
     } else if (vdid == 0 && g_savedCount > 0) {
         rdp_info("display layout now owned by a newer session — not restoring");
     }
+    /* Final call by the session that still owns the layout = the remote user
+     * really left (a reconnect would have taken ownership). Lock the Mac so
+     * nobody at the desk can use the unlocked session. */
+    if (owner && vdid == 0) lock_screen_now();
     pthread_mutex_unlock(&g_layoutLock);
 }
 #endif
@@ -568,6 +635,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
             if (_hidpi) select_hidpi_mode(_did, _w, _h);
             if (CGMainDisplayID() != _did)
                 _layoutGen = apply_session_layout(_did, _w, _h, _hidpi);
+            log_lock_state_at_connect(_did);
         } else {
             rdp_error("virtual display has no displayID — main display");
         }
