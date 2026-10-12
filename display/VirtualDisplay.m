@@ -431,20 +431,35 @@ static void lock_screen_now(void) {
     }
 }
 
-static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lockAfter) {
+static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lockOnLeave) {
     pthread_mutex_lock(&g_layoutLock);
     BOOL owner = (gen != 0 && gen == g_layoutGen);
+
+    /* The session that still owns the layout is ending = the remote user really
+     * left (a reconnect would have superseded it). Lock on the FIRST call, while
+     * the virtual display is still the only display, so the physical monitors
+     * light up already behind the lock screen — no unlocked window while they
+     * are being re-enabled (which can take ~20s). */
+    if (owner && vdid != 0) {
+        if (lockOnLeave) lock_screen_now();
+        else rdp_info("superseded by a reconnecting client — not locking the screen");
+    }
+
+    CGDirectDisplayID restored[MAX_SAVED_DISPLAYS];
+    uint32_t nRestored = g_savedCount;
+    memcpy(restored, g_savedIDs, sizeof(CGDirectDisplayID) * nRestored);
+
     if (owner) {
         restore_saved_layout_locked(vdid);
     } else if (vdid == 0 && g_savedCount > 0) {
         rdp_info("display layout now owned by a newer session — not restoring");
     }
-    /* Final call by the session that still owns the layout = the remote user
-     * really left (a reconnect would have taken ownership). Lock the Mac so
-     * nobody at the desk can use the unlocked session. */
-    if (owner && vdid == 0) {
-        if (lockAfter) lock_screen_now();
-        else rdp_info("superseded by a reconnecting client — not locking the screen");
+
+    /* Verify the re-enabled monitors are covered by the lock UI. */
+    if (owner && vdid == 0 && lockOnLeave && session_screen_locked()) {
+        for (uint32_t i = 0; i < nRestored; i++)
+            rdp_info("display %u back on: locked, %u lock-UI window(s) cover it",
+                     restored[i], lock_windows_on_display(restored[i]));
     }
     pthread_mutex_unlock(&g_layoutLock);
 }
@@ -493,7 +508,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
     if (!_created) return;
 #if MACOS_RDP_VIRTUAL_DISPLAY
     /* Unmirror / move physical displays back while the virtual one still exists. */
-    restore_saved_layout(_did, _layoutGen, NO);
+    restore_saved_layout(_did, _layoutGen, self.lockOnDestroy);
     /* Release in reverse dependency order: drop the display first (stops its
      * listener thread), then the settings/mode/descriptor it referenced. */
     _vdObject     = nil;

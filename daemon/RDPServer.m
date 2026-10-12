@@ -188,7 +188,11 @@ static _Atomic int32_t g_hasActiveSession = 0;
          * BEFORE we let the new session create its own virtual display — two live
          * virtual displays would both map to the main display and fight. */
         [previous supersede];
-        if (![previous waitForTeardown:10.0])
+        /* Local patch: 10s -> 60s. Re-enabling physical displays and restoring
+         * the layout (with the screen locked) takes ~30s; proceeding early left
+         * two sessions reconfiguring displays at once and a black, unusable
+         * new session. */
+        if (![previous waitForTeardown:60.0])
             rdp_error("TAKEOVER: previous session %s did not tear down in time — "
                       "proceeding anyway (display may briefly conflict)",
                       previous.clientAddress.UTF8String);
