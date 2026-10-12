@@ -24,6 +24,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)destroy;
 - (void)setResolutionWidth:(uint32_t)width height:(uint32_t)height;
 
+/* Re-enable physical displays a previous run disabled (RDP_DISPLAY_MODE=disable)
+ * but never restored, e.g. after a crash. Call once at daemon startup. */
++ (void)recoverDisabledDisplays;
+
 @end
 
 NS_ASSUME_NONNULL_END

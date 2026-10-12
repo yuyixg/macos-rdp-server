@@ -9,6 +9,7 @@
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
 #import "daemon/AutoUpdate.h"
+#import "display/VirtualDisplay.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -99,6 +100,10 @@ int main(int argc, char *argv[]) {
         EV_SET(&kev[0], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
         EV_SET(&kev[1], SIGINT,  EVFILT_SIGNAL, EV_ADD, 0, 0, NULL);
         kevent(kq, kev, 2, NULL, 0, NULL);
+
+        /* Before accepting sessions: bring back any monitor a crashed previous
+         * run left disabled (local patch, RDP_DISPLAY_MODE=disable). */
+        [VirtualDisplay recoverDisabledDisplays];
 
         AppDelegate *delegate = [[AppDelegate alloc] init];
         RDPServer *server = [[RDPServer alloc] initWithPort:port];
