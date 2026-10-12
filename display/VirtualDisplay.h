@@ -18,6 +18,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) CGDirectDisplayID displayID;
 @property (nonatomic, readonly) uint32_t width;
 @property (nonatomic, readonly) uint32_t height;
+/* Lock the Mac when -destroy ends the session (default YES). The session sets
+ * NO when a reconnecting client supersedes it. RDP_LOCK_ON_DISCONNECT=0 wins. */
+@property (atomic, assign) BOOL lockOnDestroy;
 
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height;
 - (BOOL)create;

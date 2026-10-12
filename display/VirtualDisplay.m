@@ -3,6 +3,7 @@
 #import <unistd.h>
 #import <pthread.h>
 #import <dlfcn.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #define RDP_LOG_COMPONENT "display"
 #include "logging/RDPLog.h"
 
@@ -169,6 +170,31 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
             NSMutableString *ids = [NSMutableString string];
             for (uint32_t i = 0; i < g_savedCount; i++) [ids appendFormat:@"%u\n", g_savedIDs[i]];
             [ids writeToFile:disabled_state_path() atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+            /* If a monitor is asleep (e.g. long after a lock), wake it before
+             * disabling it. Disabling a sleeping display left the lock screen
+             * ignoring injected input until the next session; sessions that
+             * found the display awake could always type the password. */
+            BOOL anyAsleep = NO;
+            for (uint32_t i = 0; i < g_savedCount; i++)
+                if (CGDisplayIsAsleep(g_savedIDs[i])) anyAsleep = YES;
+            if (anyAsleep) {
+                IOPMAssertionID wake = kIOPMNullAssertionID;
+                IOPMAssertionDeclareUserActivity(CFSTR("macos-rdp: wake display before disable"),
+                                                 kIOPMUserActiveLocal, &wake);
+                int waitedMs = 0;
+                for (; waitedMs < 5000; waitedMs += 100) {
+                    BOOL asleep = NO;
+                    for (uint32_t i = 0; i < g_savedCount; i++)
+                        if (CGDisplayIsAsleep(g_savedIDs[i])) asleep = YES;
+                    if (!asleep) break;
+                    usleep(100000);
+                }
+                usleep(500000);   /* let loginwindow notice the wake */
+                rdp_info("physical display(s) were asleep — woke them first (%d ms%s)",
+                         waitedMs, waitedMs >= 5000 ? ", still asleep" : "");
+                if (wake != kIOPMNullAssertionID) IOPMAssertionRelease(wake);
+            }
 
             ce = set_displays_enabled(g_savedIDs, g_savedCount, false);
             if (ce == kCGErrorSuccess) {
@@ -376,14 +402,19 @@ static uint32_t lock_windows_on_display(CGDirectDisplayID did) {
     return n;
 }
 
-/* Connecting to a locked Mac: loginwindow does cover the new virtual display,
- * but macOS 15 shows only the wallpaper until a key/mouse event brings up the
- * password field. Log it so "only wallpaper" reports are easy to diagnose. */
-static void log_lock_state_at_connect(CGDirectDisplayID vdid) {
+/* Connecting to a locked Mac. loginwindow's windows do cover the new virtual
+ * display, but when the lock was taken long before (display slept meanwhile)
+ * the lock UI ignores injected input. Re-issuing the lock once the virtual
+ * display is the only display makes loginwindow re-present it there, and input
+ * then reaches the password field (macOS 15 shows only the wallpaper until a
+ * key/mouse event reveals it). */
+static void present_lock_screen_if_locked(CGDirectDisplayID vdid) {
     if (!session_screen_locked()) return;
-    rdp_info("screen is locked at connect (%u lock-UI window(s) on virtual display) — "
-             "press any key in the client to show the password field",
-             lock_windows_on_display(vdid));
+    void (*fn)(void) = lock_fn();
+    if (fn) fn();
+    rdp_info("screen is locked at connect — lock UI re-presented on virtual display "
+             "(%u lock-UI window(s)%s); press any key in the client for the password field",
+             lock_windows_on_display(vdid), fn ? "" : ", SACLockScreenImmediate unavailable");
 }
 
 /* Lock the Mac on disconnect. RDP_LOCK_ON_DISCONNECT=0 disables. Remote unlock
@@ -400,7 +431,7 @@ static void lock_screen_now(void) {
     }
 }
 
-static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
+static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lockAfter) {
     pthread_mutex_lock(&g_layoutLock);
     BOOL owner = (gen != 0 && gen == g_layoutGen);
     if (owner) {
@@ -411,7 +442,10 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
     /* Final call by the session that still owns the layout = the remote user
      * really left (a reconnect would have taken ownership). Lock the Mac so
      * nobody at the desk can use the unlocked session. */
-    if (owner && vdid == 0) lock_screen_now();
+    if (owner && vdid == 0) {
+        if (lockAfter) lock_screen_now();
+        else rdp_info("superseded by a reconnecting client — not locking the screen");
+    }
     pthread_mutex_unlock(&g_layoutLock);
 }
 #endif
@@ -428,6 +462,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
     if ((self = [super init])) {
         _w = width;
         _h = height;
+        _lockOnDestroy = YES;
     }
     return self;
 }
@@ -458,7 +493,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
     if (!_created) return;
 #if MACOS_RDP_VIRTUAL_DISPLAY
     /* Unmirror / move physical displays back while the virtual one still exists. */
-    restore_saved_layout(_did, _layoutGen);
+    restore_saved_layout(_did, _layoutGen, NO);
     /* Release in reverse dependency order: drop the display first (stops its
      * listener thread), then the settings/mode/descriptor it referenced. */
     _vdObject     = nil;
@@ -467,7 +502,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
     _vdDescriptor = nil;
     /* Let WindowServer drop the virtual display, then settle the layout. */
     usleep(300000);
-    restore_saved_layout(0, _layoutGen);
+    restore_saved_layout(0, _layoutGen, self.lockOnDestroy);
     _layoutGen = 0;
 #endif
     _did = 0;
@@ -635,7 +670,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen) {
             if (_hidpi) select_hidpi_mode(_did, _w, _h);
             if (CGMainDisplayID() != _did)
                 _layoutGen = apply_session_layout(_did, _w, _h, _hidpi);
-            log_lock_state_at_connect(_did);
+            present_lock_screen_if_locked(_did);
         } else {
             rdp_error("virtual display has no displayID — main display");
         }
