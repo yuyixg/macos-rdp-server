@@ -69,25 +69,48 @@
     }
 
     _capturing = YES;
+    [self startStreamAttempt:1];
+    return YES;
+}
 
+/* Local patch: retry the display lookup. Right after the virtual display is
+ * created — especially while a previous session is still restoring displays —
+ * SCShareableContent can list no displays (or not ours yet). Previously that
+ * fell through to "no SCDisplay available" and a permanently black session, or
+ * to capturing whatever display came first. */
+#define CAPTURE_LOOKUP_ATTEMPTS 10
+- (void)startStreamAttempt:(int)attempt {
+    uint32_t width = _capW, height = _capH;
     __weak typeof(self) weak = self;
     /* SCShareableContent enumeration is async — set up the stream in its callback. */
     [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content,
                                                                    NSError *error) {
         typeof(self) self_ = weak;
         if (!self_ || !self_.capturing) return;
-        if (error || !content) {
-            rdp_error("SCShareableContent failed: %s",
-                      error.localizedDescription.UTF8String ?: "unknown");
-            return;
-        }
 
         SCDisplay *target = nil;
         for (SCDisplay *d in content.displays) {
             if (d.displayID == self_.displayID) { target = d; break; }
         }
-        if (!target) target = content.displays.firstObject;
-        if (!target) { rdp_error("no SCDisplay available for capture"); return; }
+        if (!target) {
+            if (attempt < CAPTURE_LOOKUP_ATTEMPTS) {
+                rdp_info("capture: display %u not available yet (%lu listed%s%s) — retry %d/%d",
+                         self_.displayID, (unsigned long)content.displays.count,
+                         error ? ", " : "", error ? error.localizedDescription.UTF8String : "",
+                         attempt, CAPTURE_LOOKUP_ATTEMPTS - 1);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), self_.captureQueue, ^{
+                    [weak startStreamAttempt:attempt + 1];
+                });
+                return;
+            }
+            target = content.displays.firstObject;
+            if (!target) {
+                rdp_error("no SCDisplay available for capture after %d attempts", attempt);
+                return;
+            }
+            rdp_error("capture: display %u never appeared — falling back to display %u",
+                      self_.displayID, target.displayID);
+        }
 
         SCContentFilter *filter =
             [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
@@ -156,8 +179,6 @@
         self_.heartbeat = hb;
         dispatch_resume(hb);
     }];
-
-    return YES;
 }
 
 /* SCStreamOutput */

@@ -18,11 +18,18 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) CGDirectDisplayID displayID;
 @property (nonatomic, readonly) uint32_t width;
 @property (nonatomic, readonly) uint32_t height;
+/* Lock the Mac when -destroy ends the session (default YES). The session sets
+ * NO when a reconnecting client supersedes it. RDP_LOCK_ON_DISCONNECT=0 wins. */
+@property (atomic, assign) BOOL lockOnDestroy;
 
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height;
 - (BOOL)create;
 - (void)destroy;
 - (void)setResolutionWidth:(uint32_t)width height:(uint32_t)height;
+
+/* Re-enable physical displays a previous run disabled (RDP_DISPLAY_MODE=disable)
+ * but never restored, e.g. after a crash. Call once at daemon startup. */
++ (void)recoverDisabledDisplays;
 
 @end
 

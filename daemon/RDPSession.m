@@ -40,6 +40,8 @@ static const uint32_t kDefaultBitrate = 8000;
  * skip re-authenticating / re-activating on a subsequent Activate (mstsc may
  * re-activate on a resize). Guarded by the serial session queue. */
 @property (nonatomic, assign) BOOL activated;
+/* Set by -supersede (takeover by a reconnecting client): skip lock on teardown. */
+@property (atomic, assign) BOOL superseded;
 @end
 
 @implementation RDPSession
@@ -340,6 +342,11 @@ static void rdp_on_keyframe_request(void *ud) {
     _sessionState = RDPSessionStateDisconnecting;
 }
 
+- (void)supersede {
+    self.superseded = YES;
+    [self disconnect];
+}
+
 - (BOOL)waitForTeardown:(NSTimeInterval)timeout {
     dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW,
                                              (int64_t)(timeout * NSEC_PER_SEC));
@@ -358,6 +365,7 @@ static void rdp_on_keyframe_request(void *ud) {
     [_audio stop];
     [_clipboard stop];
     [_displayControl stop];
+    _display.lockOnDestroy = !self.superseded;
     [_display destroy];
 
     if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }

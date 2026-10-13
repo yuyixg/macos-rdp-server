@@ -72,7 +72,37 @@ static const uint16_t kExtScanToVK[256] = {
     [0x5C] = 55,  /* RCmd */
 };
 
+/* Local patch: explicit modifier flags. Events created with a NULL source
+ * inherit the session's current flags, and macOS tags navigation/function keys
+ * with Fn — so after an arrow key, Fn stayed set and "E" arrived as Fn+E
+ * (Edit > Emoji & Symbols). We track modifiers from the client's own key
+ * up/down and stamp every injected event with exactly those. */
+static CGEventFlags modifierFlagForVK(CGKeyCode vk) {
+    switch (vk) {
+        case 56: case 60: return kCGEventFlagMaskShift;      /* L/R Shift */
+        case 59: case 62: return kCGEventFlagMaskControl;    /* L/R Control */
+        case 58: case 61: return kCGEventFlagMaskAlternate;  /* L/R Option (Alt) */
+        case 55: case 54: return kCGEventFlagMaskCommand;    /* L/R Command (Win) */
+        default:          return 0;
+    }
+}
+
+/* Keys macOS itself reports with Fn (and arrows also with NumericPad). */
+static CGEventFlags implicitFlagsForVK(CGKeyCode vk) {
+    switch (vk) {
+        case 123: case 124: case 125: case 126:              /* arrows */
+            return kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+        case 114: case 115: case 116: case 117: case 119: case 121: /* Help Home PgUp FwdDel End PgDn */
+        case 122: case 120: case 99:  case 118: case 96:  case 97:  /* F1-F6 */
+        case 98:  case 100: case 101: case 109: case 103: case 111: /* F7-F12 */
+            return kCGEventFlagMaskSecondaryFn;
+        default:
+            return 0;
+    }
+}
+
 @interface InputInjector ()
+@property (nonatomic, assign) CGEventFlags modFlags;   /* client-held modifiers */
 @property (nonatomic, assign) CGDirectDisplayID displayID;
 @property (nonatomic, assign) uint32_t srcW;   /* RDP desktop width  (pointer coord space) */
 @property (nonatomic, assign) uint32_t srcH;   /* RDP desktop height */
@@ -117,8 +147,15 @@ static const uint16_t kExtScanToVK[256] = {
     CGKeyCode vk = [self keyCodeForScanCode:code extended:isExtended];
     if (vk == 0xFFFF) return;
 
+    CGEventFlags modBit = modifierFlagForVK(vk);
+    if (modBit) {
+        if (isRelease) _modFlags &= ~modBit;
+        else           _modFlags |= modBit;
+    }
+
     CGEventRef event = CGEventCreateKeyboardEvent(NULL, vk, !isRelease);
     if (!event) return;
+    CGEventSetFlags(event, _modFlags | implicitFlagsForVK(vk));
 
     /* Post to the session event stream so it reaches the frontmost app. */
     CGEventPost(kCGSessionEventTap, event);
@@ -179,6 +216,7 @@ static const uint16_t kExtScanToVK[256] = {
 
     CGEventRef event = CGEventCreateMouseEvent(NULL, type, pos, button);
     if (!event) return;
+    CGEventSetFlags(event, _modFlags);   /* e.g. Cmd-click; never a stale Fn */
     CGEventPost(kCGSessionEventTap, event);
     CFRelease(event);
 }
@@ -204,6 +242,7 @@ static const uint16_t kExtScanToVK[256] = {
         horizontal ? lines : 0
     );
     if (!event) return;
+    CGEventSetFlags(event, _modFlags);
     CGEventPost(kCGSessionEventTap, event);
     CFRelease(event);
 }

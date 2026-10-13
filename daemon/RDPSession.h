@@ -42,6 +42,10 @@ typedef NS_ENUM(NSInteger, RDPSessionState) {
  * assertions). Safe to call from any thread; returns immediately. */
 - (void)disconnect;
 
+/* Like -disconnect, but because a newer session from a reconnecting client is
+ * taking over: teardown restores the display but does NOT lock the screen. */
+- (void)supersede;
+
 /* Block the calling thread until this session's teardown has fully completed
  * (virtual display released, peer destroyed). Returns YES if teardown finished
  * within `timeout` seconds, NO on timeout. Used by the takeover path so a new
