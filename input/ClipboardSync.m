@@ -16,13 +16,28 @@
 @property (nonatomic, strong) dispatch_source_t pollTimer;
 @end
 
+/* Local patch: NSPasteboard is not thread-safe. Polling ran on a concurrent
+ * global queue and client pastes arrived on the peer thread, and with several
+ * sessions alive at once two threads read the pasteboard together and crashed
+ * in -[NSPasteboard _updateTypeCacheIfNeeded] (SIGSEGV). Every pasteboard
+ * access, from every session, now goes through this one serial queue. */
+static dispatch_queue_t pasteboard_queue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.macosrdp.pasteboard", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
 @implementation ClipboardSync
 
 - (void)start {
-    _lastChangeCount = NSPasteboard.generalPasteboard.changeCount;
+    __block NSInteger cc = 0;
+    dispatch_sync(pasteboard_queue(), ^{ cc = NSPasteboard.generalPasteboard.changeCount; });
+    _lastChangeCount = cc;
 
-    _pollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    _pollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, pasteboard_queue());
     dispatch_source_set_timer(_pollTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
                               (uint64_t)(NSEC_PER_SEC / 4), NSEC_PER_SEC / 8); /* ~4 Hz */
     __weak typeof(self) weak = self;
@@ -71,8 +86,18 @@
     }
 }
 
-/* Windows -> Mac: client sent clipboard data; place it on the Mac pasteboard. */
+/* Windows -> Mac: client sent clipboard data; place it on the Mac pasteboard.
+ * Called from the peer loop while it holds the transport lock, and a poll on
+ * the pasteboard queue may be waiting for that lock to send — so hop over
+ * ASYNCHRONOUSLY (with a copy of the bytes) to avoid a deadlock. */
 - (void)receiveFromClient:(const uint8_t *)data length:(size_t)len format:(uint32_t)format {
+    NSData *copy = [NSData dataWithBytes:data length:len];
+    dispatch_async(pasteboard_queue(), ^{
+        [self receiveOnPasteboardQueue:copy.bytes length:copy.length format:format];
+    });
+}
+
+- (void)receiveOnPasteboardQueue:(const uint8_t *)data length:(size_t)len format:(uint32_t)format {
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     [pb clearContents];
     if (format == RDP_CB_FORMAT_UNICODETEXT || format == RDP_CB_FORMAT_TEXT) {

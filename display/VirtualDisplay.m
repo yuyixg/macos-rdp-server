@@ -48,6 +48,7 @@
  * The original arrangement is saved and put back on destroy. Uses the ONLINE
  * display list so sleeping displays (e.g. after screen lock) count. */
 #define MAX_SAVED_DISPLAYS 16
+#define RDP_VIRTUAL_VENDOR_ID 0x5244500u   /* vendor/product of our virtual displays */
 static CGDirectDisplayID g_savedIDs[MAX_SAVED_DISPLAYS];
 static CGRect            g_savedBounds[MAX_SAVED_DISPLAYS];
 static uint32_t          g_savedCount = 0;
@@ -145,6 +146,9 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
             /* Skip ourselves and displays in a user-made mirror set (they
              * follow their own master). */
             if (d == vdid || (m != kCGNullDirectDisplay && m != vdid)) continue;
+            /* Never treat another session's virtual display as a physical
+             * monitor (seen as "3 physical displays" when one was left over). */
+            if (CGDisplayVendorNumber(d) == RDP_VIRTUAL_VENDOR_ID) continue;
             g_savedIDs[g_savedCount] = d;
             g_savedBounds[g_savedCount] = CGDisplayBounds(d);
             g_savedCount++;
@@ -599,8 +603,8 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
         CGSize mm = CGSizeMake((_w / dpi) * 25.4, (_h / dpi) * 25.4);
         [desc setValue:[NSValue valueWithBytes:&mm objCType:@encode(CGSize)]
                 forKey:@"sizeInMillimeters"];
-        @try { [desc setValue:@(0x5244500u) forKey:@"productID"]; } @catch (id e) {}
-        @try { [desc setValue:@(0x5244500u) forKey:@"vendorID"];  } @catch (id e) {}
+        @try { [desc setValue:@(RDP_VIRTUAL_VENDOR_ID) forKey:@"productID"]; } @catch (id e) {}
+        @try { [desc setValue:@(RDP_VIRTUAL_VENDOR_ID) forKey:@"vendorID"];  } @catch (id e) {}
         /* Local patch: alternate serial 1/2 so a takeover session's display gets
          * a different ID from the one the old session is still releasing. */
         static uint32_t serialCounter = 0;
