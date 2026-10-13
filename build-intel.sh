@@ -72,15 +72,25 @@ echo "OK: $BIN ($(lipo -archs "$BIN"), self-contained)"
 # 4. Optional deploy. System LibreSSL first: OpenSSL 3's default PKCS#12
 #    encryption can't be imported by `security import`.
 if [[ "${1:-}" == "--install" ]]; then
+    GUI="gui/$(id -u)"; LABEL="com.macosrdp.agent"
+    agent_pid() { launchctl print "$GUI/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3; exit}'; }
+    OLD_PID="$(agent_pid)"
     PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" bash scripts/install-user.sh "$BIN" || true
     # install-user.sh bootstraps right after an async bootout, which can fail
-    # with "Bad request" while the old instance is still exiting. Retry.
-    GUI="gui/$(id -u)"; LABEL="com.macosrdp.agent"
-    for _ in 1 2 3 4 5; do
-        launchctl print "$GUI/$LABEL" >/dev/null 2>&1 && break
-        sleep 1
-        launchctl bootstrap "$GUI" "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+    # with "Bad request" while the old instance is still exiting — and the old
+    # instance can briefly still look loaded. Only accept a NEW pid that is
+    # listening on the port; otherwise keep re-bootstrapping.
+    PORT="${RDP_PORT:-3389}"
+    for _ in $(seq 1 15); do
+        PID="$(agent_pid)"
+        if [[ -n "$PID" && "$PID" != "$OLD_PID" ]] &&
+           lsof -nP -a -p "$PID" -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "agent running (pid $PID, listening on $PORT)"
+            exit 0
+        fi
+        [[ -z "$PID" ]] && launchctl bootstrap "$GUI" "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+        sleep 2
     done
-    launchctl print "$GUI/$LABEL" >/dev/null 2>&1 \
-        && echo "agent running" || { echo "agent failed to load" >&2; exit 1; }
+    echo "agent failed to start a new instance listening on $PORT" >&2
+    exit 1
 fi

@@ -305,7 +305,19 @@ static void rdp_on_keyframe_request(void *ud) {
         rdp_verbose("client did not request audio — capture skipped");
     }
 
+    /* Local patch: a reconnecting client may have superseded us while we were
+     * setting up (-supersede sets Disconnecting from another thread). Writing
+     * Active unconditionally clobbered that, so the session never exited, the
+     * takeover timed out after 60s, and two virtual displays ran at once. */
+    BOOL wasDisconnecting = (_sessionState == RDPSessionStateDisconnecting);
     _sessionState = RDPSessionStateActive;
+    /* -supersede sets the flag BEFORE writing Disconnecting, so checking it after
+     * our write closes the race: either we see it here, or its write lands last. */
+    if (wasDisconnecting || self.superseded) {
+        rdp_info("superseded during setup — not activating %s", _address.UTF8String);
+        _sessionState = RDPSessionStateDisconnecting;
+        return;
+    }
     rdp_info("session active for %s", _address.UTF8String);
 
     /* Advertise a client-side system cursor first so the very first pointer the
