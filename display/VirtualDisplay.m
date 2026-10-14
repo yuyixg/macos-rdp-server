@@ -85,13 +85,79 @@ static NSString *disabled_state_path(void) {
     return [NSHomeDirectory() stringByAppendingPathComponent:@".macos-rdp/disabled-displays"];
 }
 
-/* Enable/disable a set of displays in one transaction. */
+/* Defined further down (lock helpers). */
+static BOOL session_screen_locked(void);
+static void (*lock_fn(void))(void);
+
+/* Registry of virtual display IDs this process created and hasn't released.
+ * macOS does NOT report the descriptor's vendorID back through
+ * CGDisplayVendorNumber, so a vendor check can't recognise our displays
+ * (it counted 0 of them and wrongly forced extend mode). Track them instead. */
+static CGDirectDisplayID g_liveVirtual[MAX_SAVED_DISPLAYS];
+static uint32_t          g_liveVirtualCount = 0;
+static pthread_mutex_t   g_liveVirtualLock = PTHREAD_MUTEX_INITIALIZER;
+
+static void register_virtual_display(CGDirectDisplayID d) {
+    pthread_mutex_lock(&g_liveVirtualLock);
+    if (g_liveVirtualCount < MAX_SAVED_DISPLAYS) g_liveVirtual[g_liveVirtualCount++] = d;
+    pthread_mutex_unlock(&g_liveVirtualLock);
+}
+
+static void unregister_virtual_display(CGDirectDisplayID d) {
+    pthread_mutex_lock(&g_liveVirtualLock);
+    for (uint32_t i = 0; i < g_liveVirtualCount; i++) {
+        if (g_liveVirtual[i] != d) continue;
+        g_liveVirtual[i] = g_liveVirtual[--g_liveVirtualCount];   /* drop one entry */
+        break;
+    }
+    pthread_mutex_unlock(&g_liveVirtualLock);
+}
+
+static BOOL is_our_virtual_display(CGDirectDisplayID d) {
+    BOOL found = NO;
+    pthread_mutex_lock(&g_liveVirtualLock);
+    for (uint32_t i = 0; i < g_liveVirtualCount; i++) if (g_liveVirtual[i] == d) found = YES;
+    pthread_mutex_unlock(&g_liveVirtualLock);
+    return found;
+}
+
+/* Number of our virtual displays alive in this process (each takeover session
+ * creates its own; >1 means a previous session hasn't released its display). */
+static uint32_t rdp_virtual_display_count(void) {
+    pthread_mutex_lock(&g_liveVirtualLock);
+    uint32_t n = g_liveVirtualCount;
+    pthread_mutex_unlock(&g_liveVirtualLock);
+    return n;
+}
+
+/* Only real, present physical monitors may be passed to the private
+ * enable/disable call. Enabling a dead virtual display ID (left in the state
+ * file by a crashed run) scrambled WindowServer's display state and a later
+ * reconfiguration crashed WindowServer (forced logout, 2026-10-13 11:29). */
+static BOOL is_safe_physical_display(CGDirectDisplayID d) {
+    return d != kCGNullDirectDisplay &&
+           CGDisplayIsOnline(d) &&
+           !is_our_virtual_display(d) &&
+           CGDisplayVendorNumber(d) != RDP_VIRTUAL_VENDOR_ID;
+}
+
+/* Enable/disable a set of displays in one transaction (unsafe IDs skipped). */
 static CGError set_displays_enabled(const CGDirectDisplayID *ids, uint32_t n, bool enabled) {
     CGSConfigureDisplayEnabledFn fn = display_enable_fn();
     if (!fn || n == 0) return kCGErrorFailure;
     CGDisplayConfigRef cfg = NULL;
     if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return kCGErrorFailure;
-    for (uint32_t i = 0; i < n; i++) fn(cfg, ids[i], enabled);
+    uint32_t applied = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!is_safe_physical_display(ids[i])) {
+            rdp_error("skipping display %u for %s: not an online physical monitor",
+                      ids[i], enabled ? "enable" : "disable");
+            continue;
+        }
+        fn(cfg, ids[i], enabled);
+        applied++;
+    }
+    if (applied == 0) { CGCancelDisplayConfiguration(cfg); return kCGErrorFailure; }
     return CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
 }
 
@@ -148,7 +214,8 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
             if (d == vdid || (m != kCGNullDirectDisplay && m != vdid)) continue;
             /* Never treat another session's virtual display as a physical
              * monitor (seen as "3 physical displays" when one was left over). */
-            if (CGDisplayVendorNumber(d) == RDP_VIRTUAL_VENDOR_ID) continue;
+            if (is_our_virtual_display(d) ||
+                CGDisplayVendorNumber(d) == RDP_VIRTUAL_VENDOR_ID) continue;
             g_savedIDs[g_savedCount] = d;
             g_savedBounds[g_savedCount] = CGDisplayBounds(d);
             g_savedCount++;
@@ -167,8 +234,18 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
     CGError ce = kCGErrorFailure;
     g_disabled = NO;
     if (display_mode() == DISPLAY_MODE_DISABLE) {
+        /* NOTE: no CGDisplayIsActive(vdid) gate here. On a locked Mac after a
+         * takeover the new virtual display reports inactive for 5s+ even though
+         * disabling the physical displays works (and is what makes the lock
+         * screen usable); gating on it forced extend mode and a dead lock screen. */
+        uint32_t ours = rdp_virtual_display_count();
         if (!display_enable_fn()) {
             rdp_error("CGSConfigureDisplayEnabled unavailable — falling back to extend");
+        } else if (ours != 1) {
+            /* Another session's virtual display is still alive (or ours isn't
+             * up). Don't stack a private-API reconfiguration on a messy state. */
+            rdp_error("%u RDP virtual display(s) online (expected 1) — not disabling "
+                      "physical displays this session, falling back to extend", ours);
         } else {
             /* Persist first: if we die after disabling, startup re-enables. */
             NSMutableString *ids = [NSMutableString string];
@@ -198,6 +275,23 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
                 rdp_info("physical display(s) were asleep — woke them first (%d ms%s)",
                          waitedMs, waitedMs >= 5000 ? ", still asleep" : "");
                 if (wake != kIOPMNullAssertionID) IOPMAssertionRelease(wake);
+            }
+
+            /* Locked Mac: re-issue the lock while the physical display is still
+             * the active main display, then let it settle, and only then disable
+             * it. Waking alone was not enough — after a long-idle lock the first
+             * session sometimes still got no password field, while every second
+             * attempt worked; what those had in common was a fresh lock taken on
+             * the physical display just before it was disabled (the previous
+             * session's teardown). This reproduces that on the first attempt. */
+            if (session_screen_locked()) {
+                void (*fn)(void) = lock_fn();
+                if (fn) {
+                    fn();
+                    usleep(2000000);
+                    rdp_info("screen locked at connect — lock UI refreshed on the physical "
+                             "display before disabling it");
+                }
             }
 
             ce = set_displays_enabled(g_savedIDs, g_savedCount, false);
@@ -519,6 +613,7 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
     _vdSettings   = nil;
     _vdMode       = nil;
     _vdDescriptor = nil;
+    unregister_virtual_display(_did);
     /* Let WindowServer drop the virtual display, then settle the layout. */
     usleep(300000);
     restore_saved_layout(0, _layoutGen, self.lockOnDestroy);
@@ -677,8 +772,9 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
             _vdMode       = mode;
             _vdSettings   = settings;
             _did = vdid;
-            rdp_info("virtual display created: displayID=%u %ux%u (applied=%d)",
-                     _did, _w, _h, applied);
+            register_virtual_display(vdid);
+            rdp_info("virtual display created: displayID=%u %ux%u (applied=%d, reported vendor 0x%x)",
+                     _did, _w, _h, applied, CGDisplayVendorNumber(vdid));
 
             /* Make the virtual display the MAIN display so the menu bar, Dock, and
              * newly-opened windows land ON it. Otherwise apps open on the built-in
