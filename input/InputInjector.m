@@ -247,4 +247,38 @@ static CGEventFlags implicitFlagsForVK(CGKeyCode vk) {
     CFRelease(event);
 }
 
+- (void)releaseAll {
+    /* Up events at the current pointer position (the display may be gone). */
+    CGEventRef here = CGEventCreate(NULL);
+    CGPoint pos = here ? CGEventGetLocation(here) : CGPointZero;
+    if (here) CFRelease(here);
+
+    struct { BOOL *down; CGEventType up; CGMouseButton button; const char *name; } buttons[] = {
+        { &_leftDown,   kCGEventLeftMouseUp,  kCGMouseButtonLeft,   "left"   },
+        { &_rightDown,  kCGEventRightMouseUp, kCGMouseButtonRight,  "right"  },
+        { &_middleDown, kCGEventOtherMouseUp, kCGMouseButtonCenter, "middle" },
+    };
+    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
+        if (!*buttons[i].down) continue;
+        CGEventRef ev = CGEventCreateMouseEvent(NULL, buttons[i].up, pos, buttons[i].button);
+        if (ev) { CGEventSetFlags(ev, 0); CGEventPost(kCGSessionEventTap, ev); CFRelease(ev); }
+        *buttons[i].down = NO;
+        rdp_info("released stuck %s mouse button on session end", buttons[i].name);
+    }
+
+    if (_modFlags) {
+        /* One flags-changed event with no modifiers clears them all. */
+        CGEventRef ev = CGEventCreateKeyboardEvent(NULL, 56 /* Shift */, false);
+        if (ev) {
+            CGEventSetType(ev, kCGEventFlagsChanged);
+            CGEventSetFlags(ev, 0);
+            CGEventPost(kCGSessionEventTap, ev);
+            CFRelease(ev);
+        }
+        rdp_info("released held modifiers (flags 0x%llx) on session end",
+                 (unsigned long long)_modFlags);
+        _modFlags = 0;
+    }
+}
+
 @end

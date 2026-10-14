@@ -371,6 +371,7 @@ static void rdp_on_keyframe_request(void *ud) {
 
 - (void)teardown {
     rdp_verbose("tearing down session for %s", _address.UTF8String);
+    [_injector releaseAll];
     [_cursor stop];
     [_capture stop];
     [_encoder stop];

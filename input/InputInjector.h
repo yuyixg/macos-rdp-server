@@ -35,6 +35,12 @@ NS_ASSUME_NONNULL_BEGIN
 /* Wheel rotation is encoded entirely within flags; decoded internally. */
 - (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 
+/* Release every mouse button and modifier this session still holds down. Call
+ * on session end: a client that disconnects mid-click never sends the "up", and
+ * the Mac then treats every later pointer move (local, VNC, next session) as a
+ * drag. */
+- (void)releaseAll;
+
 @end
 
 NS_ASSUME_NONNULL_END
