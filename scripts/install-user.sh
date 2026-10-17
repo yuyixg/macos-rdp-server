@@ -128,6 +128,8 @@ cat > "$PLIST" <<PL
     <key>StandardOutPath</key><string>$HOME/Library/Logs/macos-rdp-agent.log</string>
     <key>StandardErrorPath</key><string>$HOME/Library/Logs/macos-rdp-agent.error.log</string>
     <key>ThrottleInterval</key><integer>5</integer>
+    <!-- Give session teardown (lock + restore displays) time on stop/restart. -->
+    <key>ExitTimeOut</key><integer>60</integer>
     <key>ProcessType</key><string>Interactive</string>
     <key>LimitLoadToSessionType</key><string>Aqua</string>
 </dict>

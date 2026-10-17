@@ -134,10 +134,18 @@ static uint32_t rdp_virtual_display_count(void) {
  * enable/disable call. Enabling a dead virtual display ID (left in the state
  * file by a crashed run) scrambled WindowServer's display state and a later
  * reconfiguration crashed WindowServer (forced logout, 2026-10-13 11:29). */
+/* macOS's own placeholder ("unkn"/"virt") shown when no real monitor is
+ * driving — never a physical display to disable or re-enable. */
+static BOOL is_macos_placeholder_display(CGDirectDisplayID d) {
+    return CGDisplayVendorNumber(d) == 0x756e6b6eu /* 'unkn' */ &&
+           CGDisplayModelNumber(d)  == 0x76697274u /* 'virt' */;
+}
+
 static BOOL is_safe_physical_display(CGDirectDisplayID d) {
     return d != kCGNullDirectDisplay &&
            CGDisplayIsOnline(d) &&
            !is_our_virtual_display(d) &&
+           !is_macos_placeholder_display(d) &&
            CGDisplayVendorNumber(d) != RDP_VIRTUAL_VENDOR_ID;
 }
 
@@ -214,7 +222,7 @@ static void apply_session_layout_locked(CGDirectDisplayID vdid, uint32_t vw, uin
             if (d == vdid || (m != kCGNullDirectDisplay && m != vdid)) continue;
             /* Never treat another session's virtual display as a physical
              * monitor (seen as "3 physical displays" when one was left over). */
-            if (is_our_virtual_display(d) ||
+            if (is_our_virtual_display(d) || is_macos_placeholder_display(d) ||
                 CGDisplayVendorNumber(d) == RDP_VIRTUAL_VENDOR_ID) continue;
             g_savedIDs[g_savedCount] = d;
             g_savedBounds[g_savedCount] = CGDisplayBounds(d);
@@ -451,10 +459,34 @@ static void recover_disabled_displays(void) {
         if (line.length == 0 || n >= MAX_SAVED_DISPLAYS) continue;
         ids[n++] = (CGDirectDisplayID)strtoul(line.UTF8String, NULL, 10);
     }
-    CGError ce = set_displays_enabled(ids, n, true);
-    rdp_info("startup: re-enabled %u display(s) left disabled by a previous run (rc=%d)", n, ce);
-    if (ce == kCGErrorSuccess)
+    /* Let WindowServer finish removing the previous process's virtual display
+     * first: re-enabling 30ms after a restart was silently ignored and left
+     * both monitors dark behind a placeholder display. */
+    usleep(2000000);
+
+    CGError ce = kCGErrorFailure;
+    uint32_t back = 0;
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        ce = set_displays_enabled(ids, n, true);
+        usleep(3000000);
+        back = 0;
+        CGDirectDisplayID online[MAX_SAVED_DISPLAYS];
+        uint32_t on = 0;
+        CGGetOnlineDisplayList(MAX_SAVED_DISPLAYS, online, &on);
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t j = 0; j < on; j++)
+                if (online[j] == ids[i] && CGDisplayIsActive(ids[i])) back++;
+        rdp_info("startup: re-enable attempt %d for %u display(s) left disabled by a previous "
+                 "run: rc=%d, %u back in the display list", attempt, n, ce, back);
+        if (back == n) break;
+    }
+    /* Keep the state file if they didn't all come back, so the next start
+     * retries — unless none of them is even present (e.g. unplugged). */
+    if (back == n || ce == kCGErrorFailure)
         [[NSFileManager defaultManager] removeItemAtPath:disabled_state_path() error:NULL];
+    else
+        rdp_error("startup: only %u of %u display(s) came back — keeping %s for the next start",
+                  back, n, disabled_state_path().UTF8String);
 }
 
 /* Put physical displays back where they were. Called twice from -destroy:
@@ -538,7 +570,10 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
      * the virtual display is still the only display, so the physical monitors
      * light up already behind the lock screen — no unlocked window while they
      * are being re-enabled (which can take ~20s). */
-    if (owner && vdid != 0) {
+    /* gen == 0: this session never arranged displays (e.g. the virtual display
+     * was already main). It still must lock — only a takeover (lockOnLeave=NO)
+     * or a newer layout owner skips it. */
+    if (vdid != 0 && (owner || gen == 0)) {
         if (lockOnLeave) lock_screen_now();
         else rdp_info("superseded by a reconnecting client — not locking the screen");
     }
@@ -783,8 +818,10 @@ static void restore_saved_layout(CGDirectDisplayID vdid, uint64_t gen, BOOL lock
              * (0,0) = main, and move the former main (built-in) to its right. */
             usleep(400000);
             if (_hidpi) select_hidpi_mode(_did, _w, _h);
-            if (CGMainDisplayID() != _did)
-                _layoutGen = apply_session_layout(_did, _w, _h, _hidpi);
+            /* Always arrange: even if the virtual display already became main
+             * (e.g. the monitors were asleep/absent), physical displays may be
+             * present and must be handled — skipping left them unmanaged. */
+            _layoutGen = apply_session_layout(_did, _w, _h, _hidpi);
             present_lock_screen_if_locked(_did);
         } else {
             rdp_error("virtual display has no displayID — main display");

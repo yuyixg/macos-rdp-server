@@ -146,12 +146,26 @@ static _Atomic int32_t g_hasActiveSession = 0;
         close(_listenFd);
         _listenFd = -1;
     }
+    NSArray<RDPSession *> *ending = nil;
     @synchronized(self) {
         rdp_verbose("disconnecting %lu active sessions", (unsigned long)_sessions.count);
-        for (RDPSession *s in _sessions) [s disconnect];
+        ending = [_sessions copy];
+        for (RDPSession *s in ending) [s disconnect];
         [_sessions removeAllObjects];
         _activeSession = nil;
         [self updateActiveSessionFlag];
+    }
+
+    /* Local patch: wait for each session's teardown (lock the screen, re-enable
+     * and restore the physical displays) before the process exits. Exiting
+     * right away on a restart/deploy left the Mac unlocked and the monitors
+     * disabled. Teardown can take ~30s; the LaunchAgent's ExitTimeOut is 60s. */
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45.0];
+    for (RDPSession *s in ending) {
+        NSTimeInterval left = [deadline timeIntervalSinceNow];
+        if (left <= 0) { rdp_error("shutdown: out of time waiting for session teardown"); break; }
+        if ([s waitForTeardown:left])
+            rdp_info("shutdown: session %s finished teardown", s.clientAddress.UTF8String);
     }
 }
 
